@@ -27,8 +27,13 @@ jobs:
         include:
           - image: multica-backend
             dockerfile: Dockerfile
+            cache_flag: ""
+          # --no-cache: the first two web builds failed in ACR Tasks with
+          # "failed to get layer ... layer does not exist" at COPY apps/web/
+          # (runs cr2, cr3), a builder storage fault, not a Dockerfile fault.
           - image: multica-web
             dockerfile: Dockerfile.web
+            cache_flag: "--no-cache"
     steps:
       - uses: actions/checkout@v4
 
