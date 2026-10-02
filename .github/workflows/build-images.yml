@@ -2,6 +2,12 @@
 # (Next.js web) from this branch into the Armitage registry acrarmitagemkt.
 # Sign-in is OIDC (federated credential on the armitage branch), so no registry
 # password or client secret is stored in GitHub.
+#
+# Backend: built inside ACR Tasks (`az acr build`).
+# Web: built with docker buildx on the runner and pushed to the ACR. ACR Tasks'
+# classic builder failed twice on a clean agent at `COPY apps/web/ apps/web/` with
+# "failed to get layer ... layer does not exist" (ACR runs cr2 and cr3, 3 Oct 2026);
+# BuildKit does not have that fault. Planner ruling, 3 Oct 2026.
 name: build-images
 
 on:
@@ -15,25 +21,13 @@ permissions:
 
 env:
   ACR_NAME: acrarmitagemkt
+  ACR_SERVER: acrarmitagemkt.azurecr.io
   IMAGE_TAG: 0.6.1-armitage.${{ github.run_number }}
 
 jobs:
-  build:
+  backend:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: multica-backend
-            dockerfile: Dockerfile
-            cache_flag: ""
-          # --no-cache: the first two web builds failed in ACR Tasks with
-          # "failed to get layer ... layer does not exist" at COPY apps/web/
-          # (runs cr2, cr3), a builder storage fault, not a Dockerfile fault.
-          - image: multica-web
-            dockerfile: Dockerfile.web
-            cache_flag: "--no-cache"
     steps:
       - uses: actions/checkout@v4
 
@@ -43,19 +37,58 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # The build runs inside ACR Tasks, so the runner needs no Docker daemon.
-      # VERSION feeds the Go ldflags; the web image reads NEXT_PUBLIC_APP_VERSION.
-      - name: az acr build ${{ matrix.image }}
+      # VERSION feeds the Go ldflags so the server reports its own build.
+      - name: az acr build multica-backend
         run: |
           az acr build \
             --registry "$ACR_NAME" \
-            --file "${{ matrix.dockerfile }}" \
-            --image "${{ matrix.image }}:${IMAGE_TAG}" \
-            --image "${{ matrix.image }}:armitage-latest" \
+            --file Dockerfile \
+            --image "multica-backend:${IMAGE_TAG}" \
+            --image "multica-backend:armitage-latest" \
             --build-arg VERSION="${IMAGE_TAG}" \
-            --build-arg NEXT_PUBLIC_APP_VERSION="${IMAGE_TAG}" \
             --build-arg COMMIT="${{ github.sha }}" \
             --platform linux/amd64 \
             --timeout 3600 \
-            ${{ matrix.cache_flag }} \
+            .
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Short-lived ACR token from the OIDC session; masked so it never reaches the log.
+      - name: ACR token
+        id: acr
+        run: |
+          token=$(az acr login --name "$ACR_NAME" --expose-token --query accessToken -o tsv)
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_SERVER }}
+          username: 00000000-0000-0000-0000-000000000000
+          password: ${{ steps.acr.outputs.token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The web image reads NEXT_PUBLIC_APP_VERSION; VERSION is passed too so both
+      # images are stamped by the same build-arg name.
+      - name: docker buildx build multica-web
+        run: |
+          docker buildx build \
+            --file Dockerfile.web \
+            --platform linux/amd64 \
+            --build-arg VERSION="${IMAGE_TAG}" \
+            --build-arg NEXT_PUBLIC_APP_VERSION="${IMAGE_TAG}" \
+            --tag "${ACR_SERVER}/multica-web:${IMAGE_TAG}" \
+            --tag "${ACR_SERVER}/multica-web:armitage-latest" \
+            --push \
             .
